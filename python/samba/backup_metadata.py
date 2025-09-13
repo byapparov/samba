@@ -172,10 +172,20 @@ class BackupMetadata:
         count = 0
         try:
             # Search for all objects
-            res = self.samdb.search(base=base_dn,
-                                   scope=scope,
-                                   attrs=["*"],
-                                   controls=["show_deleted:1"])
+            # Only use show_deleted control if the DB supports it
+            try:
+                res = self.samdb.search(base=base_dn,
+                                       scope=scope,
+                                       attrs=["*"],
+                                       controls=["show_deleted:1"])
+            except ldb.LdbError as e:
+                if "Unsupported critical extension" in str(e):
+                    # Fallback without the control
+                    res = self.samdb.search(base=base_dn,
+                                           scope=scope,
+                                           attrs=["*"])
+                else:
+                    raise
 
             for msg in res:
                 dn = str(msg.dn)

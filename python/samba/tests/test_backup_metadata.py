@@ -307,6 +307,155 @@ class BackupMetadataCreationTests(BackupMetadataTestBase):
         self.assertEqual(groups[0]["dn"], group_dn)
 
 
+class BackupMetadataErrorTests(BackupMetadataTestBase):
+    """Tests for error handling and edge cases."""
+
+    def test_collect_domain_info_with_samdb(self):
+        """Test domain info collection with SamDB-like interface."""
+        # Create a mock SamDB-like object with domain methods
+        class MockSamDB:
+            def __init__(self):
+                self.has_domain_methods = True
+
+            def domain_dn(self):
+                return "DC=mock,DC=example,DC=com"
+
+            def get_domain_sid(self):
+                return "S-1-5-21-123456789-123456789-123456789"
+
+            def get_schema_basedn(self):
+                return "CN=Schema,CN=Configuration,DC=mock,DC=example,DC=com"
+
+            def search(self, base, scope, attrs):
+                # Mock search result
+                class MockMessage:
+                    def get(self, attr, default):
+                        if attr == "objectVersion":
+                            return [b"88"]
+                        return default
+                return [MockMessage()]
+
+        # Mock dsdb.functional_level
+        import samba.backup_metadata as bm
+        original_functional_level = getattr(bm.dsdb, 'functional_level', None)
+        bm.dsdb.functional_level = lambda x: "2016"
+
+        try:
+            metadata = BackupMetadata(MockSamDB())
+            metadata.collect_domain_info()
+
+            # Verify domain info was collected
+            self.assertEqual(metadata.metadata["domain_info"]["domain_dn"],
+                           "DC=mock,DC=example,DC=com")
+            self.assertEqual(metadata.metadata["domain_info"]["functional_level"], "2016")
+            self.assertEqual(metadata.metadata["domain_info"]["domain_sid"],
+                           "S-1-5-21-123456789-123456789-123456789")
+        finally:
+            # Restore original function
+            if original_functional_level:
+                bm.dsdb.functional_level = original_functional_level
+
+    def test_collect_domain_info_error_handling(self):
+        """Test error handling in domain info collection."""
+        # Create a mock that raises exceptions
+        class FailingSamDB:
+            def domain_dn(self):
+                raise Exception("Failed to get domain DN")
+
+        metadata = BackupMetadata(FailingSamDB())
+
+        # Should raise exception
+        with self.assertRaises(Exception):
+            metadata.collect_domain_info()
+
+    def test_add_object_metadata_with_sid(self):
+        """Test metadata addition with SID handling."""
+        from samba.dcerpc import security
+        from samba.ndr import ndr_pack
+
+        metadata = BackupMetadata(self.samdb)
+
+        # Create SID and pack it
+        test_sid = security.dom_sid("S-1-5-21-1234567890-1234567890-1234567890-1001")
+        sid_bytes = ndr_pack(test_sid)
+
+        attributes = {
+            "objectClass": ["user"],
+            "objectSid": [sid_bytes],
+            "objectGUID": [b'\x01\x23\x45\x67\x89\xab\xcd\xef\x01\x23\x45\x67\x89\xab\xcd\xef'],
+            "whenChanged": ["20250113120000.0Z"],
+            "sAMAccountName": ["testuser"]
+        }
+
+        test_dn = "CN=TestUser,CN=Users,DC=test,DC=example,DC=com"
+        metadata.add_object_metadata(test_dn, attributes)
+
+        obj_meta = metadata.get_object_metadata(test_dn)
+        self.assertEqual(obj_meta["objectSid"], str(test_sid))
+
+    def test_collect_all_objects_error_handling(self):
+        """Test error handling in collect_all_objects."""
+        # Create a mock that fails on search
+        class FailingLdb:
+            def search(self, base, scope, attrs, controls=None):
+                raise Exception("Search failed")
+
+        metadata = BackupMetadata(FailingLdb())
+
+        with self.assertRaises(Exception):
+            metadata.collect_all_objects()
+
+    def test_metadata_with_relationships(self):
+        """Test metadata collection with object relationships."""
+        metadata = BackupMetadata(self.samdb)
+
+        attributes = {
+            "objectClass": ["group"],
+            "member": ["CN=User1,CN=Users,DC=test,DC=example,DC=com",
+                      "CN=User2,CN=Users,DC=test,DC=example,DC=com"],
+            "managedBy": ["CN=Manager,CN=Users,DC=test,DC=example,DC=com"]
+        }
+
+        test_dn = "CN=TestGroup,CN=Users,DC=test,DC=example,DC=com"
+        metadata.add_object_metadata(test_dn, attributes)
+
+        obj_meta = metadata.get_object_metadata(test_dn)
+        self.assertIn("member", obj_meta["relationships"])
+        self.assertEqual(len(obj_meta["relationships"]["member"]), 2)
+        self.assertIn("managedBy", obj_meta["relationships"])
+
+    def test_load_from_nonexistent_file(self):
+        """Test loading metadata from non-existent file."""
+        with self.assertRaises(FileNotFoundError):
+            BackupMetadata.load_from_file("/nonexistent/path/metadata.json")
+
+    def test_save_load_roundtrip(self):
+        """Test saving and loading metadata roundtrip."""
+        metadata = BackupMetadata(self.samdb)
+
+        # Add some test data
+        user_dn = self.create_test_user("roundtripuser")
+        res = self.samdb.search(base=user_dn, scope=ldb.SCOPE_BASE, attrs=["*"])
+        attributes = {}
+        for attr in res[0]:
+            attributes[attr] = res[0][attr]
+        metadata.add_object_metadata(user_dn, attributes)
+
+        # Save to file
+        temp_file = os.path.join(self.test_dir, "roundtrip.json")
+        metadata.save_to_file(temp_file)
+
+        # Load from file
+        loaded_metadata = BackupMetadata.load_from_file(temp_file)
+
+        # Verify data integrity
+        self.assertEqual(loaded_metadata["version"], metadata.VERSION)
+        self.assertIn(user_dn, loaded_metadata["objects"])
+
+        # Clean up
+        os.remove(temp_file)
+
+
 if __name__ == "__main__":
     import unittest
     unittest.main()
