@@ -559,7 +559,7 @@ class LdbAnalyzerErrorTests(LdbAnalyzerTestBase):
         # Create a mock message with edge cases
         class MockMessage:
             def __init__(self):
-                self.dn = type('MockDN', (), {'__str__': lambda: "CN=Test,DC=example,DC=com"})()
+                self.dn = type('MockDN', (), {'__str__': lambda self: "CN=Test,DC=example,DC=com"})()
 
             def __iter__(self):
                 return iter(['objectClass', 'emptyAttr'])
