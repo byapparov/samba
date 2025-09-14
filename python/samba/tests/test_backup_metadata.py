@@ -22,6 +22,7 @@ import json
 import os
 import tempfile
 import time
+import unittest
 from datetime import datetime, timedelta
 
 import ldb
@@ -33,7 +34,23 @@ from samba.dcerpc import security
 from samba.ndr import ndr_pack
 from samba.param import LoadParm
 from samba.provision import provision
-from samba.tests import TestCase, TestCaseInTempDir
+
+# Use standard unittest for compatibility
+TestCase = unittest.TestCase
+
+
+class TestCaseInTempDir(unittest.TestCase):
+    """Custom test case that creates temporary directories."""
+
+    def setUp(self):
+        """Set up temporary directory for each test."""
+        self.tempdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        """Clean up temporary directory after each test."""
+        import shutil
+        if os.path.exists(self.tempdir):
+            shutil.rmtree(self.tempdir)
 
 
 class BackupMetadataTestBase(TestCaseInTempDir):

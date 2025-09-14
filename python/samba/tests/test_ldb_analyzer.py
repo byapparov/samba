@@ -21,6 +21,7 @@
 import json
 import os
 import tempfile
+import unittest
 try:
     from samba import safe_tarfile as tarfile
 except ImportError:
@@ -29,7 +30,23 @@ except ImportError:
 import ldb
 from samba.ldb_analyzer import LdbAnalyzer
 from samba.backup_metadata import BackupMetadata
-from samba.tests import TestCase, TestCaseInTempDir
+
+# Use standard unittest for compatibility
+TestCase = unittest.TestCase
+
+
+class TestCaseInTempDir(unittest.TestCase):
+    """Custom test case that creates temporary directories."""
+
+    def setUp(self):
+        """Set up temporary directory for each test."""
+        self.tempdir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        """Clean up temporary directory after each test."""
+        import shutil
+        if os.path.exists(self.tempdir):
+            shutil.rmtree(self.tempdir)
 
 
 class LdbAnalyzerTestBase(TestCaseInTempDir):
