@@ -57,6 +57,8 @@ from samba.ndr import ndr_pack
 from samba.credentials import SMB_SIGNING_REQUIRED
 from samba import safe_tarfile as tarfile
 import hashlib
+from samba.backup_metadata import BackupMetadata
+from samba.ldb_analyzer import LdbAnalyzer
 
 
 # work out a SID (based on a free RID) to use when the domain gets restored.
@@ -303,6 +305,22 @@ class cmd_domain_backup_online(samba.netcmd.Command):
             add_backup_marker(samdb, "backupDate", time_str)
             add_backup_marker(samdb, "sidForRestore", new_sid)
             add_backup_marker(samdb, "backupType", "online")
+
+            # Collect backup metadata for granular operations
+            logger.info("Collecting backup metadata for granular operations...")
+            try:
+                backup_metadata = BackupMetadata(samdb, backup_type="online")
+                backup_metadata.collect_domain_info()
+                object_count = backup_metadata.collect_all_objects()
+                logger.info(f"Collected metadata for {object_count} objects")
+
+                # Save metadata to the backup directory
+                metadata_file = os.path.join(tmpdir, "backup_metadata.json")
+                backup_metadata.save_to_file(metadata_file)
+                logger.info(f"Metadata saved to {metadata_file}")
+            except Exception as e:
+                logger.warning(f"Failed to collect backup metadata: {e}")
+                logger.info("Backup will continue without granular metadata")
 
             # ensure the admin user always has a password set (same as provision)
             if no_secrets:
@@ -1233,6 +1251,30 @@ class cmd_domain_backup_offline(samba.netcmd.Command):
         temp_tar_name = os.path.join(temp_tar_dir, "samba-backup.tar.bz2")
         tar = tarfile.open(temp_tar_name, 'w:bz2')
 
+        # Collect backup metadata for granular operations (offline mode)
+        logger.info("Collecting backup metadata for granular operations...")
+        try:
+            # Open the backed up samdb for metadata collection
+            metadata_samdb = Ldb(url=paths.samdb + self.backup_ext,
+                               session_info=system_session(), lp=lp,
+                               options=["modules:"], flags=ldb.FLG_DONT_CREATE_DB)
+
+            backup_metadata = BackupMetadata(metadata_samdb, backup_type="offline")
+            backup_metadata.collect_domain_info()
+            object_count = backup_metadata.collect_all_objects()
+            logger.info(f"Collected metadata for {object_count} objects")
+
+            # Save metadata to temp directory (will be added to tar later)
+            metadata_file = os.path.join(temp_tar_dir, "backup_metadata.json")
+            backup_metadata.save_to_file(metadata_file)
+            logger.info(f"Metadata saved to {metadata_file}")
+
+            metadata_samdb.disconnect()
+            del metadata_samdb
+        except Exception as e:
+            logger.warning(f"Failed to collect backup metadata: {e}")
+            logger.info("Backup will continue without granular metadata")
+
         logger.info('running offline ntacl backup of sysvol')
         sysvol_tar_fn = 'sysvol.tar.gz'
         sysvol_tar = os.path.join(temp_tar_dir, sysvol_tar_fn)
@@ -1244,6 +1286,13 @@ class cmd_domain_backup_offline(samba.netcmd.Command):
         backup_fn = os.path.join(temp_tar_dir, "backup.txt")
         tar.add(backup_fn, os.path.basename(backup_fn))
         os.remove(backup_fn)
+
+        # Add metadata file to tar if it exists
+        metadata_fn = os.path.join(temp_tar_dir, "backup_metadata.json")
+        if os.path.exists(metadata_fn):
+            logger.info('adding backup_metadata.json to tar')
+            tar.add(metadata_fn, os.path.basename(metadata_fn))
+            os.remove(metadata_fn)
 
         logger.info('building backup tar')
 
@@ -1284,9 +1333,291 @@ class cmd_domain_backup_offline(samba.netcmd.Command):
         logger.info('Backup succeeded.')
 
 
+class cmd_domain_backup_list_objects(samba.netcmd.Command):
+    """List objects in a backup file without restoration.
+
+    Analyzes the contents of a backup file and lists all objects, optionally
+    filtered by objectClass. This command works with both online and offline
+    backups that contain metadata.
+    """
+
+    synopsis = "%prog --backup-file=<backup.tar.bz2> [options]"
+    takes_optiongroups = {
+        "sambaopts": options.SambaOptions,
+    }
+
+    takes_options = [
+        Option("--backup-file", type=str, metavar="FILE",
+               help="Path to the backup file to analyze"),
+        Option("--object-class", type=str, metavar="CLASS",
+               help="Filter objects by objectClass (e.g., user, group, organizationalUnit)"),
+        Option("--extract", action="store_true", default=False,
+               help="Extract LDB files for analysis (slower but more complete)"),
+    ]
+
+    def run(self, backup_file=None, object_class=None, extract=False, sambaopts=None):
+        if not backup_file or not os.path.exists(backup_file):
+            raise CommandError('Backup file not found or not specified.')
+
+        logger = self.get_logger()
+        logger.setLevel(logging.INFO)
+
+        try:
+            analyzer = LdbAnalyzer(backup_file, extract=extract)
+            objects = analyzer.list_objects(object_class=object_class)
+
+            if not objects:
+                self.outf.write(f"No objects found" +
+                              (f" with objectClass={object_class}" if object_class else "") + "\\n")
+                return
+
+            self.outf.write(f"Found {len(objects)} objects" +
+                          (f" with objectClass={object_class}" if object_class else "") + ":\\n\\n")
+
+            for obj in objects:
+                self.outf.write(f"DN: {obj['dn']}\\n")
+                if 'objectClass' in obj:
+                    self.outf.write(f"  objectClass: {', '.join(obj['objectClass'])}\\n")
+                if 'objectGUID' in obj:
+                    self.outf.write(f"  objectGUID: {obj['objectGUID']}\\n")
+                if 'objectSid' in obj:
+                    self.outf.write(f"  objectSid: {obj['objectSid']}\\n")
+                if 'whenChanged' in obj:
+                    self.outf.write(f"  whenChanged: {obj['whenChanged']}\\n")
+                self.outf.write("\\n")
+
+        except Exception as e:
+            raise CommandError(f"Failed to analyze backup: {e}")
+        finally:
+            if 'analyzer' in locals():
+                analyzer.cleanup()
+
+
+class cmd_domain_backup_search_object(samba.netcmd.Command):
+    """Search for a specific object in a backup file.
+
+    Searches for an object by DN, GUID, or SID in the backup file without
+    requiring full restoration. Returns detailed object information.
+    """
+
+    synopsis = "%prog --backup-file=<backup.tar.bz2> [--dn=<dn>|--guid=<guid>|--sid=<sid>]"
+    takes_optiongroups = {
+        "sambaopts": options.SambaOptions,
+    }
+
+    takes_options = [
+        Option("--backup-file", type=str, metavar="FILE",
+               help="Path to the backup file to search"),
+        Option("--dn", type=str, metavar="DN",
+               help="Distinguished Name to search for"),
+        Option("--guid", type=str, metavar="GUID",
+               help="Object GUID to search for"),
+        Option("--sid", type=str, metavar="SID",
+               help="Object SID to search for"),
+        Option("--scope", type=str, default="base", metavar="SCOPE",
+               help="Search scope for DN searches: base, onelevel, subtree (default: base)"),
+        Option("--extract", action="store_true", default=False,
+               help="Extract LDB files for analysis (slower but more complete)"),
+    ]
+
+    def run(self, backup_file=None, dn=None, guid=None, sid=None,
+            scope="base", extract=False, sambaopts=None):
+        if not backup_file or not os.path.exists(backup_file):
+            raise CommandError('Backup file not found or not specified.')
+
+        if not any([dn, guid, sid]):
+            raise CommandError('Must specify one of --dn, --guid, or --sid.')
+
+        if sum(bool(x) for x in [dn, guid, sid]) > 1:
+            raise CommandError('Can only specify one of --dn, --guid, or --sid.')
+
+        logger = self.get_logger()
+        logger.setLevel(logging.INFO)
+
+        try:
+            analyzer = LdbAnalyzer(backup_file, extract=extract)
+
+            if dn:
+                result = analyzer.search_by_dn(dn, scope=scope)
+            elif guid:
+                result = analyzer.search_by_guid(guid)
+            elif sid:
+                result = analyzer.search_by_sid(sid)
+
+            if not result:
+                search_term = dn or guid or sid
+                self.outf.write(f"Object not found: {search_term}\\n")
+                return
+
+            # Handle single result vs multiple results
+            results = result if isinstance(result, list) else [result]
+
+            self.outf.write(f"Found {len(results)} object(s):\\n\\n")
+
+            for obj in results:
+                self.outf.write(f"DN: {obj['dn']}\\n")
+                if 'objectClass' in obj:
+                    self.outf.write(f"objectClass: {', '.join(obj['objectClass'])}\\n")
+                if 'objectGUID' in obj:
+                    self.outf.write(f"objectGUID: {obj['objectGUID']}\\n")
+                if 'objectSid' in obj:
+                    self.outf.write(f"objectSid: {obj['objectSid']}\\n")
+
+                # Show attributes if available
+                if 'attributes' in obj and obj['attributes']:
+                    self.outf.write("Attributes:\\n")
+                    for attr, value in obj['attributes'].items():
+                        self.outf.write(f"  {attr}: {value}\\n")
+                self.outf.write("\\n")
+
+        except Exception as e:
+            raise CommandError(f"Failed to search backup: {e}")
+        finally:
+            if 'analyzer' in locals():
+                analyzer.cleanup()
+
+
+class cmd_domain_backup_export_ldif(samba.netcmd.Command):
+    """Export an object from backup to LDIF format.
+
+    Exports a specific object from the backup file to LDIF format, which can
+    be useful for examining object attributes or importing into other systems.
+    """
+
+    synopsis = "%prog --backup-file=<backup.tar.bz2> --dn=<dn> [options]"
+    takes_optiongroups = {
+        "sambaopts": options.SambaOptions,
+    }
+
+    takes_options = [
+        Option("--backup-file", type=str, metavar="FILE",
+               help="Path to the backup file"),
+        Option("--dn", type=str, metavar="DN",
+               help="Distinguished Name of object to export"),
+        Option("--output", type=str, metavar="FILE",
+               help="Output file (default: stdout)"),
+        Option("--extract", action="store_true", default=False,
+               help="Extract LDB files for analysis (slower but more complete)"),
+    ]
+
+    def run(self, backup_file=None, dn=None, output=None, extract=False, sambaopts=None):
+        if not backup_file or not os.path.exists(backup_file):
+            raise CommandError('Backup file not found or not specified.')
+
+        if not dn:
+            raise CommandError('Must specify --dn.')
+
+        logger = self.get_logger()
+        logger.setLevel(logging.INFO)
+
+        try:
+            analyzer = LdbAnalyzer(backup_file, extract=extract)
+            ldif_data = analyzer.export_to_ldif(dn)
+
+            if not ldif_data:
+                raise CommandError(f"Object not found: {dn}")
+
+            if output:
+                with open(output, 'w') as f:
+                    f.write(ldif_data)
+                self.outf.write(f"LDIF exported to {output}\\n")
+            else:
+                self.outf.write(ldif_data)
+                self.outf.write("\\n")
+
+        except Exception as e:
+            raise CommandError(f"Failed to export LDIF: {e}")
+        finally:
+            if 'analyzer' in locals():
+                analyzer.cleanup()
+
+
+class cmd_domain_backup_compare(samba.netcmd.Command):
+    """Compare two backup files to identify differences.
+
+    Compares objects between two backup files and reports additions,
+    modifications, and deletions. Useful for understanding changes
+    between backup snapshots.
+    """
+
+    synopsis = "%prog --backup1=<file1> --backup2=<file2>"
+    takes_optiongroups = {
+        "sambaopts": options.SambaOptions,
+    }
+
+    takes_options = [
+        Option("--backup1", type=str, metavar="FILE",
+               help="Path to the first (older) backup file"),
+        Option("--backup2", type=str, metavar="FILE",
+               help="Path to the second (newer) backup file"),
+        Option("--extract", action="store_true", default=False,
+               help="Extract LDB files for analysis (slower but more complete)"),
+    ]
+
+    def run(self, backup1=None, backup2=None, extract=False, sambaopts=None):
+        if not backup1 or not os.path.exists(backup1):
+            raise CommandError('First backup file not found or not specified.')
+        if not backup2 or not os.path.exists(backup2):
+            raise CommandError('Second backup file not found or not specified.')
+
+        logger = self.get_logger()
+        logger.setLevel(logging.INFO)
+
+        analyzer1 = None
+        analyzer2 = None
+        try:
+            analyzer1 = LdbAnalyzer(backup1, extract=extract)
+            analyzer2 = LdbAnalyzer(backup2, extract=extract)
+
+            differences = analyzer1.compare_with(analyzer2)
+
+            # Report results
+            total_changes = (len(differences['added']) +
+                           len(differences['deleted']) +
+                           len(differences['modified']))
+
+            if total_changes == 0:
+                self.outf.write("No differences found between backups.\\n")
+                return
+
+            self.outf.write(f"Backup comparison results ({total_changes} changes):\\n\\n")
+
+            if differences['added']:
+                self.outf.write(f"Added objects ({len(differences['added'])}):\\n")
+                for dn in differences['added']:
+                    self.outf.write(f"  + {dn}\\n")
+                self.outf.write("\\n")
+
+            if differences['deleted']:
+                self.outf.write(f"Deleted objects ({len(differences['deleted'])}):\\n")
+                for dn in differences['deleted']:
+                    self.outf.write(f"  - {dn}\\n")
+                self.outf.write("\\n")
+
+            if differences['modified']:
+                self.outf.write(f"Modified objects ({len(differences['modified'])}):\\n")
+                for dn, changes in differences['modified'].items():
+                    self.outf.write(f"  ~ {dn}\\n")
+                    if changes.get('old') and changes.get('new'):
+                        self.outf.write(f"    whenChanged: {changes['old']} -> {changes['new']}\\n")
+                self.outf.write("\\n")
+
+        except Exception as e:
+            raise CommandError(f"Failed to compare backups: {e}")
+        finally:
+            if analyzer1:
+                analyzer1.cleanup()
+            if analyzer2:
+                analyzer2.cleanup()
+
+
 class cmd_domain_backup(samba.netcmd.SuperCommand):
     """Create or restore a backup of the domain."""
     subcommands = {'offline': cmd_domain_backup_offline(),
                    'online': cmd_domain_backup_online(),
                    'rename': cmd_domain_backup_rename(),
-                   'restore': cmd_domain_backup_restore()}
+                   'restore': cmd_domain_backup_restore(),
+                   'list-objects': cmd_domain_backup_list_objects(),
+                   'search-object': cmd_domain_backup_search_object(),
+                   'export-ldif': cmd_domain_backup_export_ldif(),
+                   'compare': cmd_domain_backup_compare()}

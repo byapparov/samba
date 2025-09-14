@@ -1498,6 +1498,15 @@ for env in ["ad_dc_backup", smbv1_disabled_testenv]:
 
 planoldpythontestsuite("ad_dc",
                        "samba.tests.domain_backup_offline")
+
+# Granular backup restoration tests
+planoldpythontestsuite("ad_dc",
+                       "samba.tests.test_backup_metadata")
+planoldpythontestsuite("ad_dc",
+                       "samba.tests.test_backup_integration")
+planoldpythontestsuite("ad_dc",
+                       "samba.tests.test_ldb_analyzer")
+
 # Encrypted secrets
 # ensure default provision (ad_dc) and join (vampire_dc)
 # encrypt secret values on disk.
